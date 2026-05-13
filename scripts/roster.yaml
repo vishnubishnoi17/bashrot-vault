@@ -1,0 +1,17 @@
+wardens:
+  - username: yashwant
+    image_url: "https://api.dicebear.com/7.x/pixel-art/svg?seed=yashwant"
+
+guards:
+  - username: guard1
+    image_url: "https://api.dicebear.com/7.x/pixel-art/svg?seed=guard1"
+  - username: guard2
+    image_url: "https://api.dicebear.com/7.x/pixel-art/svg?seed=guard2"
+
+bashers:
+  - username: skndash
+    image_url: "https://api.dicebear.com/7.x/pixel-art/svg?seed=skndash"
+    ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... skndash@host"
+  - username: basher2
+    image_url: "https://api.dicebear.com/7.x/pixel-art/svg?seed=basher2"
+    ssh_public_key: "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... basher2@host"

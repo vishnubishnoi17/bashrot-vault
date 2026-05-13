@@ -1,0 +1,73 @@
+#!/bin/bash
+# =============================================================================
+# verifyHeist — Monitor Drop_Zone dirs, validate heist attempts, broadcast wins
+# Runs as a systemd service (root). Permission is enforced at the filesystem
+# level (script is root:wardens 750) so only wardens can invoke it directly.
+# The systemd service runs as root — no group check needed inside the script.
+# =============================================================================
+set -euo pipefail
+
+BASHER_HOME="/home/bashers"
+SLANG="/etc/vault/slang.txt"
+HEIST_LOG="/var/log/vault/heist.log"
+POLL_INTERVAL=5
+
+mkdir -p "$(dirname "$HEIST_LOG")"
+touch "$HEIST_LOG"
+chown root:wardens "$HEIST_LOG" 2>/dev/null || true
+chmod 640 "$HEIST_LOG"
+setfacl -m "g:guards:r--"  "$HEIST_LOG" 2>/dev/null || true
+setfacl -m "g:wardens:rw-" "$HEIST_LOG" 2>/dev/null || true
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$HEIST_LOG"; }
+
+[[ -f "$SLANG" ]]      || { log "ERROR: slang.txt not found at $SLANG"; exit 1; }
+[[ -d "$BASHER_HOME" ]] || { log "ERROR: $BASHER_HOME does not exist. Run initRoster first."; exit 1; }
+
+mapfile -t VALID_WORDS < "$SLANG"
+declare -A SEEN_FILES
+
+log "=== verifyHeist started (PID=$$) ==="
+
+while true; do
+    for basher_dir in "$BASHER_HOME"/*/; do
+        [[ -d "$basher_dir" ]] || continue
+        basher=$(basename "$basher_dir")
+        drop_zone="${basher_dir}Drop_Zone"
+        [[ -d "$drop_zone" ]] || continue
+
+        while IFS= read -r -d '' dropped_file; do
+            [[ "${SEEN_FILES[$dropped_file]+_}" ]] && continue
+            SEEN_FILES["$dropped_file"]=1
+
+            file_content=$(cat "$dropped_file" 2>/dev/null | tr -d '[:space:]')
+            [[ -z "$file_content" ]] && continue
+
+            valid=0
+            matched_word=""
+            for word in "${VALID_WORDS[@]}"; do
+                clean_word=$(echo "$word" | tr -d '[:space:]')
+                [[ -z "$clean_word" ]] && continue
+                if [[ "$file_content" == "$clean_word" ]]; then
+                    valid=1
+                    matched_word="$clean_word"
+                    break
+                fi
+            done
+
+            timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+            filename=$(basename "$dropped_file")
+            file_size=$(stat -c%s "$dropped_file" 2>/dev/null || echo "?")
+
+            if [[ $valid -eq 1 ]]; then
+                wall "🔥 HEIST SUCCESSFUL! Basher '${basher}' cracked the vault and stole '${matched_word}'! 🔥" 2>/dev/null || true
+                log "SUCCESS | basher=${basher} | word=${matched_word} | file=${filename} | size=${file_size}B"
+                echo "[${timestamp}] VALID HEIST | basher=${basher} | word=${matched_word} | file=${filename}" >> "$HEIST_LOG"
+            else
+                log "INVALID | basher=${basher} | file=${filename} | content='${file_content}'"
+            fi
+        done < <(find "$drop_zone" -maxdepth 1 -type f -print0 2>/dev/null)
+    done
+
+    sleep "$POLL_INTERVAL"
+done

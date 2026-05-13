@@ -1,0 +1,203 @@
+#!/bin/bash
+# =============================================================================
+# trendSetters — Dynamic leaderboard engine for bashers (wardens only)
+# Scoring: Streak (peak 5-min window) + Clutch Factor + Decay Penalty
+# Usage: trendSetters
+# =============================================================================
+set -euo pipefail
+
+HEIST_LOG="/var/log/vault/heist.log"
+LEADERBOARD_LOG="/var/log/vault/leaderboard.log"
+PREV_LEADERBOARD="/var/log/vault/leaderboard_prev.txt"
+
+mkdir -p "$(dirname "$LEADERBOARD_LOG")"
+chown root:wardens "$LEADERBOARD_LOG" 2>/dev/null || true
+chmod 640 "$LEADERBOARD_LOG"
+setfacl -m "g:guards:r--"  "$LEADERBOARD_LOG" 2>/dev/null || true
+setfacl -m "g:wardens:rw-" "$LEADERBOARD_LOG" 2>/dev/null || true
+
+# ── Permission check: wardens only ───────────────────────────────────────────
+if ! id -Gn | grep -qw "wardens"; then
+    echo "Access denied: wardens only." >&2
+    exit 1
+fi
+
+[[ -f "$HEIST_LOG" ]] || { echo "No heist log found. No data yet."; exit 0; }
+
+NOW=$(date +%s)
+WINDOW_24H=$(( NOW - 86400 ))
+
+# =============================================================================
+# Parse heist.log for valid heists in last 24h
+# Log format: [TIMESTAMP] VALID HEIST | basher=NAME | word=WORD | file=FILE
+# FIX: use [^| ]+ (no pipe, no space) for reliable basher name extraction
+# =============================================================================
+declare -A BASHER_HEIST_TIMES
+declare -A BASHER_LAST_HEIST
+
+while IFS= read -r line; do
+    ts_str=$(echo "$line" | grep -oP '(?<=\[)[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}(?=\])')
+    [[ -z "$ts_str" ]] && continue
+
+    epoch=$(date -d "$ts_str" +%s 2>/dev/null) || continue
+    (( epoch < WINDOW_24H )) && continue
+
+    echo "$line" | grep -qE "SUCCESS|VALID HEIST" || continue
+
+    # FIX: [^| ]+ stops at pipe OR space, avoids capturing trailing whitespace
+    basher=$(echo "$line" | grep -oP '(?<=basher=)[^| ]+' | tr -d ' ')
+    [[ -z "$basher" ]] && continue
+
+    BASHER_HEIST_TIMES[$basher]="${BASHER_HEIST_TIMES[$basher]:-} $epoch"
+
+    current_last="${BASHER_LAST_HEIST[$basher]:-0}"
+    (( epoch > current_last )) && BASHER_LAST_HEIST[$basher]=$epoch
+done < "$HEIST_LOG"
+
+# ── Identify who did the most recent heist (Clutch Factor) ───────────────────
+CLUTCH_BASHER=""
+CLUTCH_TIME=0
+for b in "${!BASHER_LAST_HEIST[@]}"; do
+    t="${BASHER_LAST_HEIST[$b]}"
+    (( t > CLUTCH_TIME )) && CLUTCH_TIME=$t && CLUTCH_BASHER="$b"
+done
+
+ACTIVE_BASHERS=${#BASHER_LAST_HEIST[@]}
+(( ACTIVE_BASHERS == 0 )) && { echo "No active bashers in the last 24h."; exit 0; }
+
+NORM=$ACTIVE_BASHERS
+
+# =============================================================================
+# Compute scores
+# =============================================================================
+declare -A SCORES
+declare -A STREAK_SCORES
+declare -A CLUTCH_SCORES
+declare -A DECAY_PENALTIES
+
+for basher in "${!BASHER_HEIST_TIMES[@]}"; do
+    times_str="${BASHER_HEIST_TIMES[$basher]}"
+    read -ra times <<< "$times_str"
+
+    # ── STREAK: find peak 5-minute window ────────────────────────────────────
+    IFS=$'\n' sorted_times=($(printf '%s\n' "${times[@]}" | sort -n)); unset IFS
+    peak_count=0
+    n=${#sorted_times[@]}
+    for (( i=0; i<n; i++ )); do
+        window_start="${sorted_times[$i]}"
+        window_end=$(( window_start + 300 ))
+        count=0
+        for (( j=i; j<n; j++ )); do
+            (( sorted_times[j] <= window_end )) && (( count++ )) || break
+        done
+        (( count > peak_count )) && peak_count=$count
+    done
+    streak_score=$(( peak_count * 10 ))
+
+    # ── CLUTCH FACTOR ─────────────────────────────────────────────────────────
+    clutch_score=0
+    [[ "$basher" == "$CLUTCH_BASHER" ]] && clutch_score=50
+
+    # ── DECAY FACTOR ─────────────────────────────────────────────────────────
+    last="${BASHER_LAST_HEIST[$basher]}"
+    elapsed=$(( NOW - last ))
+    (( elapsed < 1 )) && elapsed=1
+    elapsed_min=$(( elapsed / 60 ))
+    decay=$(awk -v e="$elapsed_min" 'BEGIN { printf "%d", 10 * log(e + 1) }')
+
+    raw_score=$(( streak_score + clutch_score - decay ))
+    (( raw_score < 0 )) && raw_score=0
+
+    final_score=$(awk -v r="$raw_score" -v n="$NORM" 'BEGIN { printf "%.2f", r / n }')
+
+    SCORES[$basher]="$final_score"
+    STREAK_SCORES[$basher]="$streak_score"
+    CLUTCH_SCORES[$basher]="$clutch_score"
+    DECAY_PENALTIES[$basher]="$decay"
+done
+
+# =============================================================================
+# Sort bashers by score desc, then by last heist time desc for tie-breaking
+# =============================================================================
+sorted_bashers=()
+while IFS= read -r line; do
+    sorted_bashers+=("$line")
+done < <(
+    for b in "${!SCORES[@]}"; do
+        echo "${SCORES[$b]} ${BASHER_LAST_HEIST[$b]} $b"
+    done | sort -k1,1rn -k2,2rn | awk '{print $3}'
+)
+
+# =============================================================================
+# Load previous leaderboard for position comparison
+# =============================================================================
+declare -A PREV_RANK
+if [[ -f "$PREV_LEADERBOARD" ]]; then
+    while IFS= read -r line; do
+        rank=$(echo "$line" | awk '{print $1}')
+        name=$(echo "$line" | awk '{print $2}')
+        PREV_RANK[$name]="$rank"
+    done < "$PREV_LEADERBOARD"
+fi
+
+# =============================================================================
+# Display top 3
+# =============================================================================
+TIMESTAMP=$(date '+%Y-%m-%d %H:%M:%S')
+echo "════════════════════════════════════════════════════════"
+echo "         🔥  TRENDSETTERS LEADERBOARD  🔥"
+echo "         Generated: $TIMESTAMP"
+echo "════════════════════════════════════════════════════════"
+echo ""
+
+echo "[$TIMESTAMP] === TRENDSETTERS LEADERBOARD ===" >> "$LEADERBOARD_LOG"
+
+rank=0
+: > "$PREV_LEADERBOARD"  # reset for next run
+
+for basher in "${sorted_bashers[@]}"; do
+    (( rank++ ))
+    echo "$rank $basher" >> "$PREV_LEADERBOARD"
+    (( rank > 3 )) && continue
+
+    score="${SCORES[$basher]}"
+    streak="${STREAK_SCORES[$basher]}"
+    clutch="${CLUTCH_SCORES[$basher]}"
+    decay="${DECAY_PENALTIES[$basher]}"
+    last_epoch="${BASHER_LAST_HEIST[$basher]}"
+    last_str=$(date -d "@$last_epoch" '+%Y-%m-%d %H:%M:%S')
+
+    movement=""
+    if [[ -n "${PREV_RANK[$basher]:-}" ]]; then
+        prev="${PREV_RANK[$basher]}"
+        diff=$(( prev - rank ))
+        if (( diff > 0 )); then
+            movement="▲ +${diff}"
+        elif (( diff < 0 )); then
+            movement="▼ ${diff}"
+        else
+            movement="— same"
+        fi
+    else
+        movement="(new entry)"
+    fi
+
+    medal=""
+    case $rank in
+        1) medal="🥇" ;;
+        2) medal="🥈" ;;
+        3) medal="🥉" ;;
+    esac
+
+    echo "  ${medal} #${rank} ${basher}  ${movement}"
+    echo "      Score:   ${score}  (streak=${streak}, clutch=${clutch}, decay=-${decay})"
+    echo "      Last heist: ${last_str}"
+    echo ""
+
+    echo "  #${rank} ${basher} | score=${score} | streak=${streak} | clutch=${clutch} | decay=${decay} | last=${last_str} | move=${movement}" >> "$LEADERBOARD_LOG"
+done
+
+echo "════════════════════════════════════════════════════════"
+echo "  Active bashers (last 24h): $ACTIVE_BASHERS"
+[[ -n "$CLUTCH_BASHER" ]] && echo "  ⚡ Clutch basher: $CLUTCH_BASHER"
+echo "════════════════════════════════════════════════════════"

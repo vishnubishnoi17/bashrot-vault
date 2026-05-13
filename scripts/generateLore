@@ -1,0 +1,74 @@
+#!/bin/bash
+# =============================================================================
+# generateLore — Background service: encodes random slang words into the vault
+# Designed to run as a systemd service (or via nohup).
+# Every 30 seconds: picks a random word from slang.txt, censors bad words,
+# base64-encodes it, and dumps the result into the vault.
+# =============================================================================
+set -euo pipefail
+
+SLANG="/etc/vault/slang.txt"
+VAULT="/opt/Bashrot_vault"
+PID_FILE="/var/run/generateLore.pid"
+LOG="/var/log/vault/generateLore.log"
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+[[ -f "$SLANG" ]] || { log "ERROR: slang.txt not found at $SLANG"; exit 1; }
+[[ -d "$VAULT" ]] || { log "ERROR: Vault not found at $VAULT. Run secureVault first."; exit 1; }
+
+# ── Bad words to censor (replace each char with *) ───────────────────────────
+# These are the "cringe" words that would jam the vault mechanism.
+BAD_WORDS=("cringe" "mid" "cheugy" "normie" "basic" "boomer" "karen")
+
+# ── Write PID for wipeTimeline to kill ───────────────────────────────────────
+echo $$ > "$PID_FILE"
+log "generateLore started (PID=$$)"
+
+# ── Cleanup on exit ───────────────────────────────────────────────────────────
+cleanup() {
+    log "generateLore stopping (PID=$$)"
+    rm -f "$PID_FILE"
+}
+trap cleanup EXIT INT TERM
+
+# =============================================================================
+# Main loop
+# =============================================================================
+while true; do
+    # 1. Count lines; pick a random one
+    total_lines=$(wc -l < "$SLANG")
+    if [[ "$total_lines" -eq 0 ]]; then
+        log "WARNING: slang.txt is empty, skipping cycle."
+        sleep 30
+        continue
+    fi
+    random_line=$(( (RANDOM % total_lines) + 1 ))
+    raw_word=$(sed -n "${random_line}p" "$SLANG")
+
+    # 2. Censor bad words using sed
+    #    For each bad word, replace every character with * of the same length
+    censored_word="$raw_word"
+    for bad in "${BAD_WORDS[@]}"; do
+        # Build a * string the same length as the bad word
+        star_replacement=$(printf '%0.s*' $(seq 1 ${#bad}))
+        # Case-insensitive replacement via sed
+        censored_word=$(echo "$censored_word" | sed "s/${bad}/${star_replacement}/Ig")
+    done
+
+    # 3. Base64-encode the (possibly censored) word
+    encoded=$(echo -n "$censored_word" | base64)
+
+    # 4. Write to a uniquely named file in the vault
+    timestamp=$(date '+%Y%m%d_%H%M%S')
+    out_file="${VAULT}/lore_${timestamp}_$$.enc"
+    echo "$encoded" > "$out_file"
+    chown root:wardens "$out_file"
+    chmod 640 "$out_file"
+    # Guards and wardens can read it via group; bashers are locked out by vault ACL
+
+    log "Encoded '${censored_word}' → $(basename "$out_file")"
+
+    sleep 30
+done

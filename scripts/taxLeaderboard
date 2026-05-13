@@ -1,0 +1,43 @@
+#!/bin/bash
+# =============================================================================
+# taxLeaderboard — Read tax.log and display who got taxed the most (guards/wardens)
+# Usage: taxLeaderboard
+# =============================================================================
+set -euo pipefail
+
+TAX_LOG="/var/log/vault/tax.log"
+
+# Permission check: only guards and wardens
+CURRENT_GROUPS=$(id -Gn)
+if ! echo "$CURRENT_GROUPS" | grep -qE '\b(guards|wardens)\b'; then
+    echo "Access denied: guards and wardens only." >&2
+    exit 1
+fi
+
+[[ -f "$TAX_LOG" ]] || { echo "No tax log found at $TAX_LOG"; exit 0; }
+
+echo "════════════════════════════════════════"
+echo "       AURA TAX LEADERBOARD"
+echo "════════════════════════════════════════"
+echo "  BASHER            | TOTAL KB TAXED"
+echo "────────────────────|───────────────"
+
+# Log format: [TIMESTAMP] | BASHER_NAME | FILE_SIZE_IN_KB | FILE_NAME
+# Filter out the summary lines (those don't match the 4-field pattern)
+awk -F' \\| ' '
+    NF == 4 {
+        basher = $2
+        gsub(/^ +| +$/, "", basher)
+        kb = $3
+        gsub(/^ +| +$/, "", kb)
+        if (kb ~ /^[0-9]+$/) {
+            totals[basher] += int(kb)
+        }
+    }
+    END {
+        for (b in totals)
+            printf "%-20s| %d KB\n", b, totals[b]
+    }
+' "$TAX_LOG" | sort -t'|' -k2 -rn
+
+echo "════════════════════════════════════════"

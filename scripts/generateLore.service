@@ -1,0 +1,15 @@
+[Unit]
+Description=Vault Lore Generator — encodes slang into the Bashrot vault every 30s
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/scripts/generateLore
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=generateLore
+
+[Install]
+WantedBy=multi-user.target

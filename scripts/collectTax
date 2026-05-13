@@ -1,0 +1,65 @@
+#!/bin/bash
+# =============================================================================
+# collectTax — Storage enforcer: deletes oldest files if basher exceeds 5MB
+# Run by cron (as root). Cron expression: */5 * * * 5,6  /scripts/collectTax
+# =============================================================================
+set -euo pipefail
+
+BASHER_HOME="/home/bashers"
+TAX_LOG="/var/log/vault/tax.log"
+LIMIT_BYTES=$((5 * 1024 * 1024))   # 5 MB
+DELETE_COUNT=3
+
+mkdir -p "$(dirname "$TAX_LOG")"
+
+# Restrict log to guards + wardens only
+chown root:guards "$TAX_LOG" 2>/dev/null || true
+chmod 640 "$TAX_LOG"
+# Add wardens to ACL too
+setfacl -m "g:wardens:rw-" "$TAX_LOG" 2>/dev/null || true
+
+log_deletion() {
+    local basher="$1" file_size_kb="$2" filename="$3"
+    local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+    echo "[${ts}] | ${basher} | ${file_size_kb} | ${filename}" >> "$TAX_LOG"
+}
+
+[[ -d "$BASHER_HOME" ]] || { echo "No basher home at $BASHER_HOME"; exit 1; }
+
+for basher_dir in "$BASHER_HOME"/*/; do
+    [[ -d "$basher_dir" ]] || continue
+    basher=$(basename "$basher_dir")
+
+    # Total size in bytes (du gives KiB, convert)
+    size_bytes=$(du -sb "$basher_dir" 2>/dev/null | awk '{print $1}')
+
+    if (( size_bytes > LIMIT_BYTES )); then
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] TAXING $basher (${size_bytes} bytes > 5MB)"
+
+        # Find oldest $DELETE_COUNT regular files (excluding hidden config files)
+        mapfile -t oldest_files < <(
+            find "$basher_dir" -type f \
+                ! -name ".bashrc" ! -name ".bash_profile" \
+                ! -name ".avatar.txt" ! -name ".bash_history" \
+                -printf "%T@ %s %p\n" \
+            | sort -n \
+            | head -n "$DELETE_COUNT" \
+            | awk '{print $0}'
+        )
+
+        for entry in "${oldest_files[@]}"; do
+            file_path=$(echo "$entry" | awk '{print $3}')
+            file_size_bytes=$(echo "$entry" | awk '{print $2}')
+            file_size_kb=$(( file_size_bytes / 1024 ))
+            filename=$(basename "$file_path")
+
+            if [[ -f "$file_path" ]]; then
+                rm -f "$file_path"
+                log_deletion "$basher" "$file_size_kb" "$filename"
+                echo "  Deleted: $filename (${file_size_kb} KB)"
+            fi
+        done
+    fi
+done
+
+echo "[$(date '+%Y-%m-%d %H:%M:%S')] collectTax run complete." >> "$TAX_LOG"

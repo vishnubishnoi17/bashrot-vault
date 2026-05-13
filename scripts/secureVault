@@ -1,0 +1,95 @@
+#!/bin/bash
+# =============================================================================
+# secureVault — Build the Bashrot vault with ACLs and intentional vulnerability
+# Run as root.
+# =============================================================================
+set -euo pipefail
+
+VAULT="/opt/Bashrot_vault"
+HIDDEN_SUBDIR="${VAULT}/.shadow_corridor"
+LOG="/var/log/vault/secureVault.log"
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+command -v setfacl &>/dev/null || { log "ERROR: setfacl not found. Install acl package."; exit 1; }
+
+for grp in bashers guards wardens; do
+    getent group "$grp" &>/dev/null || { log "ERROR: Group $grp missing. Run initRoster first."; exit 1; }
+done
+
+# ── Create vault directory ────────────────────────────────────────────────────
+log "Creating vault: $VAULT"
+mkdir -p "$VAULT"
+chown root:wardens "$VAULT"
+chmod 770 "$VAULT"
+
+# ── ACLs on vault root ────────────────────────────────────────────────────────
+# guards  → rwx
+# wardens → rwx  (already via group ownership)
+# bashers → --- (locked out)
+setfacl -m "g:guards:rwx"  "$VAULT"
+setfacl -m "g:wardens:rwx" "$VAULT"
+setfacl -m "g:bashers:---" "$VAULT"
+setfacl -m "o::---"        "$VAULT"
+
+# Apply default ACLs so new files inside inherit the same policy
+setfacl -d -m "g:guards:rwx"  "$VAULT"
+setfacl -d -m "g:wardens:rwx" "$VAULT"
+setfacl -d -m "g:bashers:---" "$VAULT"
+setfacl -d -m "o::---"        "$VAULT"
+
+log "Vault ACLs set: guards/wardens=rwx, bashers=locked out"
+
+# ── Intentional vulnerability: hidden subdirectory ───────────────────────────
+# Bashers get execute-only (--x) so they can cd into it blindly but not ls it.
+log "Creating hidden subdirectory: $HIDDEN_SUBDIR"
+mkdir -p "$HIDDEN_SUBDIR"
+chown root:wardens "$HIDDEN_SUBDIR"
+chmod 770 "$HIDDEN_SUBDIR"
+
+# Override the inherited default for this specific dir
+setfacl -b "$HIDDEN_SUBDIR"                  # clear inherited ACLs first
+setfacl -m "g:bashers:--x" "$HIDDEN_SUBDIR" # execute-only for bashers
+setfacl -m "g:guards:rwx"  "$HIDDEN_SUBDIR"
+setfacl -m "g:wardens:rwx" "$HIDDEN_SUBDIR"
+setfacl -m "o::---"        "$HIDDEN_SUBDIR"
+
+log "Hidden subdirectory ACL: bashers=--x (blind navigate), guards/wardens=rwx"
+
+# ── Create a placeholder slang.txt if it doesn't exist ───────────────────────
+SLANG="/etc/vault/slang.txt"
+mkdir -p /etc/vault
+if [[ ! -f "$SLANG" ]]; then
+    cat > "$SLANG" <<'SLANG'
+rizz
+bussin
+slay
+lowkey
+highkey
+no-cap
+periodt
+sheesh
+vibe
+sus
+cap
+mog
+yeet
+snatched
+understood-the-assignment
+rent-free
+hits-different
+ate
+served
+delulu
+SLANG
+    chmod 640 "$SLANG"
+    chown root:wardens "$SLANG"
+    log "Created default slang.txt at $SLANG"
+fi
+
+log "=== secureVault complete ==="
+echo "Vault: $VAULT"
+echo "Hidden subdir: $HIDDEN_SUBDIR"
+getfacl "$VAULT"
+getfacl "$HIDDEN_SUBDIR"

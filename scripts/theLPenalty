@@ -1,0 +1,194 @@
+#!/bin/bash
+# =============================================================================
+# theLPenalty — Command auditing & penalty system for bashers
+# Install as a bash PROMPT_COMMAND or source from bashrc of bashers.
+# This script is sourced; not run directly.
+#
+# HOW TO INSTALL:
+#   Add to /home/bashers/<user>/.bashrc:
+#     export BASH_ENV=/scripts/theLPenalty_env.sh
+#   And add to /etc/bash.bashrc (for interactive shells):
+#     source /scripts/theLPenalty
+# =============================================================================
+
+PENALTY_LOG_DIR="/home/wardens"    # penalty files go into warden subdirs
+PENALTY_THRESHOLD=100              # score at which rbash kicks in
+RBASH_DURATION=1800                # 30 minutes in seconds
+AUDIT_LOG="/var/log/vault/penalty_audit.log"
+
+mkdir -p "$(dirname "$AUDIT_LOG")" 2>/dev/null || true
+
+# ── Forbidden command patterns with weights ───────────────────────────────────
+# Format: "PATTERN|WEIGHT|DESCRIPTION"
+declare -a FORBIDDEN_RULES=(
+    # Critical (weight 40): system file modification/deletion
+    "rm\s+-rf\s+/|40|attempted to delete root filesystem"
+    "rm\s+.*/(etc|bin|sbin|usr|lib|boot|sys|proc)|40|attempted to delete system files"
+    "chmod\s+.*/(etc|bin|sbin|usr|lib)|35|attempted to chmod system files"
+    "chown\s+.*/(etc|bin|sbin|usr|lib)|35|attempted to chown system files"
+    "dd\s+.*of=/dev/(sd|vd|hd|nvme)|40|attempted raw disk write"
+    "mkfs\.|40|attempted to format filesystem"
+    "> /etc/passwd|40|attempted to overwrite passwd"
+    "> /etc/shadow|40|attempted to overwrite shadow"
+    "passwd\s+root|40|attempted to change root password"
+
+    # High (weight 25): reading sensitive system files
+    "cat\s+/etc/shadow|25|attempted to read shadow file"
+    "cat\s+/etc/sudoers|25|attempted to read sudoers"
+    "sudo\s+|25|attempted sudo"
+    "su\s+-|25|attempted su to root"
+
+    # Medium (weight 15): nosing into warden/guard directories
+    "ls\s+.*home/wardens|15|snooped warden directory"
+    "cd\s+.*home/wardens|15|attempted cd into warden dir"
+    "ls\s+.*home/guards|10|snooped guard directory"
+    "find\s+.*home/wardens|15|find in warden dir"
+    "cat\s+.*home/wardens|15|attempted to read warden file"
+
+    # Low (weight 5): probing vault
+    "ls\s+.*Bashrot_vault|5|attempted ls on vault"
+    "find\s+.*Bashrot_vault|5|find on vault"
+    "cat\s+.*Bashrot_vault|5|attempted to read vault file"
+)
+
+# ── Get the penalty file for this basher (stored in any warden's subdir) ─────
+get_penalty_file() {
+    local username="$1"
+    # Find first warden directory
+    local warden_dir
+    warden_dir=$(find /home/wardens -mindepth 1 -maxdepth 1 -type d 2>/dev/null | head -1)
+    if [[ -z "$warden_dir" ]]; then
+        echo "/var/log/vault/penalties/${username}.txt"
+        mkdir -p /var/log/vault/penalties
+    else
+        echo "${warden_dir}/${username}.txt"
+    fi
+}
+
+# ── Get current penalty score ─────────────────────────────────────────────────
+get_penalty_score() {
+    local pfile="$1"
+    [[ -f "$pfile" ]] || { echo 0; return; }
+    awk -F'|' 'NF>=4 {sum += $4} END {print sum+0}' "$pfile"
+}
+
+# ── Check if basher is currently demoted ─────────────────────────────────────
+is_demoted() {
+    local username="$1"
+    local demotion_file="/var/run/vault/demoted_${username}"
+    [[ -f "$demotion_file" ]] || return 1
+    local demoted_at; demoted_at=$(cat "$demotion_file")
+    local now; now=$(date +%s)
+    (( now - demoted_at < RBASH_DURATION ))
+}
+
+# ── Enforce rbash demotion ────────────────────────────────────────────────────
+demote_to_rbash() {
+    local username="$1"
+    mkdir -p /var/run/vault
+    date +%s > "/var/run/vault/demoted_${username}"
+    # Change shell to rbash
+    usermod -s /bin/rbash "$username" 2>/dev/null || true
+    # Restrict PATH to only alias expansions (point to alias-only dir)
+    mkdir -p "/home/bashers/${username}/.restricted_bin"
+    # Create alias wrappers in restricted bin
+    for alias_cmd in cap sus mog rizz vibe bussin; do
+        cat > "/home/bashers/${username}/.restricted_bin/${alias_cmd}" <<EOF
+#!/bin/bash
+case "$alias_cmd" in
+    cap)    clear ;;
+    sus)    ls -la "\$HOME" ;;
+    mog)    tail -n 20 "\$@" ;;
+    rizz)   whoami ;;
+    vibe)   uptime ;;
+    bussin) df -h ;;
+esac
+EOF
+        chmod +x "/home/bashers/${username}/.restricted_bin/${alias_cmd}"
+    done
+    chown -R "${username}:bashers" "/home/bashers/${username}/.restricted_bin"
+
+    # Forcibly update their .bashrc PATH to only restricted bin (rbash honours this)
+    echo "export PATH=/home/bashers/${username}/.restricted_bin" \
+        >> "/home/bashers/${username}/.bashrc"
+
+    wall "⛔ Basher '${username}' has been DEMOTED to restricted shell for 30 minutes due to penalty threshold breach!" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] DEMOTED: $username" >> "$AUDIT_LOG"
+}
+
+# ── Restore from rbash demotion (called by cron or next login check) ──────────
+restore_from_rbash() {
+    local username="$1"
+    usermod -s /bin/bash "$username" 2>/dev/null || true
+    rm -f "/var/run/vault/demoted_${username}"
+    # Remove the PATH override line from bashrc
+    sed -i '/^export PATH=.*restricted_bin/d' "/home/bashers/${username}/.bashrc" 2>/dev/null || true
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] RESTORED: $username" >> "$AUDIT_LOG"
+}
+
+# =============================================================================
+# MAIN: check_command — call this from PROMPT_COMMAND with last command
+# =============================================================================
+vault_check_command() {
+    local cmd="$1"
+    local username; username=$(whoami)
+
+    # Only applies to bashers
+    id -Gn "$username" 2>/dev/null | grep -qw "bashers" || return 0
+
+    # Check if currently serving demotion time
+    if is_demoted "$username"; then
+        return 0   # already demoted, nothing more to do
+    fi
+
+    # Check if demotion has expired → restore
+    local demotion_file="/var/run/vault/demoted_${username}"
+    if [[ -f "$demotion_file" ]]; then
+        # File exists but is_demoted returned false → time elapsed
+        restore_from_rbash "$username"
+    fi
+
+    local penalty_file; penalty_file=$(get_penalty_file "$username")
+    local matched=0
+
+    for rule in "${FORBIDDEN_RULES[@]}"; do
+        IFS='|' read -r pattern weight description <<< "$rule"
+        if echo "$cmd" | grep -qP "$pattern" 2>/dev/null; then
+            matched=1
+            local ts; ts=$(date '+%Y-%m-%d %H:%M:%S')
+            # Append to penalty file: TIMESTAMP | CMD | DESCRIPTION | WEIGHT
+            echo "${ts}|${cmd}|${description}|${weight}" >> "$penalty_file"
+            chown root:wardens "$penalty_file" 2>/dev/null || true
+            chmod 640 "$penalty_file" 2>/dev/null || true
+            echo "[${ts}] PENALTY: $username | $description | weight=$weight" >> "$AUDIT_LOG"
+            echo "⚠  Penalty logged: $description (+${weight} points)"
+        fi
+    done
+
+    if [[ $matched -eq 1 ]]; then
+        local total_score; total_score=$(get_penalty_score "$penalty_file")
+        echo "   Penalty score: ${total_score}/${PENALTY_THRESHOLD}"
+        if (( total_score >= PENALTY_THRESHOLD )); then
+            echo "⛔ PENALTY THRESHOLD EXCEEDED. Demoting to restricted shell for 30 minutes..."
+            demote_to_rbash "$username"
+            exec /bin/rbash
+        fi
+    fi
+}
+
+# ── Hook into bash via PROMPT_COMMAND ────────────────────────────────────────
+# Add this block to /etc/bash.bashrc or each basher's .bashrc:
+_vault_trap_cmd=""
+vault_preexec() {
+    _vault_trap_cmd="$BASH_COMMAND"
+}
+vault_postexec() {
+    [[ -n "$_vault_trap_cmd" ]] && vault_check_command "$_vault_trap_cmd"
+    _vault_trap_cmd=""
+}
+
+# Set up traps (works in interactive shells)
+trap 'vault_preexec' DEBUG
+PROMPT_COMMAND="${PROMPT_COMMAND:+$PROMPT_COMMAND; }vault_postexec"
+
+export -f vault_check_command vault_preexec vault_postexec get_penalty_file get_penalty_score is_demoted demote_to_rbash restore_from_rbash

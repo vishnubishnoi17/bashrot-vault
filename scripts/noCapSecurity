@@ -1,0 +1,110 @@
+#!/bin/bash
+# =============================================================================
+# noCapSecurity — Generate 6767 symlinks from vault to random dirs, randomize
+#                 every 45 minutes, hide real encoded file in unknown location.
+# Run as root. Designed to be triggered by cron every 45 minutes.
+# Cron: */45 * * * * /scripts/noCapSecurity
+# =============================================================================
+set -euo pipefail
+
+VAULT="/opt/Bashrot_vault"
+SYMLINK_DIR="${VAULT}/.symlinks"
+REAL_FILE_TRACKER="/var/run/vault/real_encoded_location"
+LOG="/var/log/vault/noCapSecurity.log"
+SYMLINK_COUNT=6767
+
+mkdir -p "$(dirname "$LOG")" "$SYMLINK_DIR" /var/run/vault
+
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+# ── FIX: Clean up the previous run's hidden file before doing anything else ───
+if [[ -f "$REAL_FILE_TRACKER" ]]; then
+    # The tracker file contains two lines:
+    #   Line 1: the path to the hidden copy of the real file
+    #   Line 2: "Real symlink: <symlink_path>"
+    old_hidden_path=$(grep -v "^Real symlink:" "$REAL_FILE_TRACKER" 2>/dev/null | head -1 || true)
+    if [[ -n "$old_hidden_path" && -f "$old_hidden_path" ]]; then
+        rm -f "$old_hidden_path"
+        log "Removed previous hidden file: $old_hidden_path"
+    fi
+fi
+
+# ── Step 1: Clear old symlinks ────────────────────────────────────────────────
+log "Clearing old symlinks..."
+find "$SYMLINK_DIR" -maxdepth 1 -type l -delete 2>/dev/null || true
+
+# ── Step 2: Find the latest encoded lore file in the vault ────────────────────
+real_enc_file=$(find "$VAULT" -maxdepth 1 -name "*.enc" -type f \
+    -printf "%T@ %p\n" 2>/dev/null | sort -n | tail -1 | awk '{print $2}')
+
+if [[ -z "$real_enc_file" ]]; then
+    log "WARNING: No .enc file found in vault yet. Run generateLore first."
+    real_enc_file=""
+fi
+
+# ── Step 3: Move the real file to a random hidden location ────────────────────
+real_hidden_path=""
+if [[ -n "$real_enc_file" ]]; then
+    random_hide_dir=$(find /tmp /var/cache /var/lib -maxdepth 3 -type d \
+        2>/dev/null | shuf | head -1)
+    [[ -z "$random_hide_dir" ]] && random_hide_dir="/tmp"
+
+    hidden_name=".$(cat /proc/sys/kernel/random/uuid | tr -d '-' | head -c 12)"
+    real_hidden_path="${random_hide_dir}/${hidden_name}"
+
+    cp "$real_enc_file" "$real_hidden_path"
+    chmod 640 "$real_hidden_path"
+    chown root:wardens "$real_hidden_path" 2>/dev/null || true
+
+    # Write tracker: first line = hidden file path, second line = symlink (added later)
+    echo "$real_hidden_path" > "$REAL_FILE_TRACKER"
+    chown root:wardens "$REAL_FILE_TRACKER"
+    chmod 640 "$REAL_FILE_TRACKER"
+
+    log "Real encoded file hidden at: $real_hidden_path"
+fi
+
+# ── Step 4: Build the directory pool ─────────────────────────────────────────
+log "Building directory pool for $SYMLINK_COUNT symlinks..."
+mapfile -t dir_pool < <(
+    find / -maxdepth 4 -type d \
+        ! -path "/proc/*" ! -path "/sys/*" ! -path "/dev/*" \
+        ! -path "${VAULT}/*" ! -path "/run/*" \
+        2>/dev/null | shuf | head -n 500
+)
+
+pool_size=${#dir_pool[@]}
+if (( pool_size == 0 )); then
+    log "ERROR: No directories found for symlink pool."
+    exit 1
+fi
+
+# ── Step 5: Generate 6767 symlinks ───────────────────────────────────────────
+log "Generating $SYMLINK_COUNT symlinks..."
+real_symlink_index=$(( RANDOM % SYMLINK_COUNT ))
+real_symlink_name=""
+
+for (( i=0; i<SYMLINK_COUNT; i++ )); do
+    target_dir="${dir_pool[$(( i % pool_size ))]}"
+    link_name="${SYMLINK_DIR}/lure_$(printf '%05d' $i)"
+
+    if (( i == real_symlink_index )) && [[ -n "$real_hidden_path" ]]; then
+        ln -sf "$real_hidden_path" "$link_name"
+        real_symlink_name="$link_name"
+        log "Real symlink (index $i): $link_name → $real_hidden_path"
+    else
+        ln -sf "$target_dir" "$link_name"
+    fi
+done
+
+# ── Step 6: Set ACLs on symlink dir ──────────────────────────────────────────
+setfacl -m "g:bashers:r-x"  "$SYMLINK_DIR" 2>/dev/null || true
+setfacl -m "g:guards:r-x"   "$SYMLINK_DIR" 2>/dev/null || true
+setfacl -m "g:wardens:rwx"  "$SYMLINK_DIR" 2>/dev/null || true
+
+# ── Step 7: Append real symlink path to tracker ───────────────────────────────
+if [[ -n "$real_symlink_name" ]]; then
+    echo "Real symlink: $real_symlink_name" >> "$REAL_FILE_TRACKER"
+fi
+
+log "noCapSecurity complete. $SYMLINK_COUNT symlinks generated. Real index: $real_symlink_index"

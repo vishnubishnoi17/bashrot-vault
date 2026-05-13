@@ -1,0 +1,227 @@
+#!/bin/bash
+# =============================================================================
+# initRoster — User provisioning from roster.yaml
+# Run as root. Usage: initRoster [/path/to/roster.yaml]
+# =============================================================================
+set -euo pipefail
+
+ROSTER="${1:-/etc/vault/roster.yaml}"
+LOG="/var/log/vault/initRoster.log"
+BASHER_HOME="/home/bashers"
+GUARD_HOME="/home/guards"
+WARDEN_HOME="/home/wardens"
+SSHD_CONF="/etc/ssh/sshd_config.d/vault_bashers.conf"
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+# ── Dependency checks ─────────────────────────────────────────────────────────
+for cmd in yq jp2a curl setfacl; do
+    command -v "$cmd" &>/dev/null || { log "ERROR: Missing: $cmd"; exit 1; }
+done
+[[ -f "$ROSTER" ]] || { log "ERROR: Roster not found: $ROSTER"; exit 1; }
+
+# ── Ensure base groups exist ──────────────────────────────────────────────────
+for grp in bashers guards wardens; do
+    getent group "$grp" &>/dev/null || groupadd "$grp"
+done
+
+# ── Helper: create or update user ─────────────────────────────────────────────
+create_or_update_user() {
+    local username="$1" group="$2" home_dir="$3"
+    if id "$username" &>/dev/null; then
+        log "User $username exists — refreshing primary group to $group."
+        usermod -g "$group" "$username"
+    else
+        useradd --create-home --home-dir "$home_dir" \
+                --shell /bin/bash --gid "$group" "$username"
+        log "Created user: $username  group=$group  home=$home_dir"
+    fi
+}
+
+# ── Helper: inject SSH public key ─────────────────────────────────────────────
+inject_ssh_key() {
+    local username="$1" pubkey="$2"
+    local home_dir; home_dir=$(getent passwd "$username" | cut -d: -f6)
+    local ssh_dir="${home_dir}/.ssh"
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+    grep -qF "$pubkey" "${ssh_dir}/authorized_keys" 2>/dev/null \
+        || echo "$pubkey" >> "${ssh_dir}/authorized_keys"
+    chmod 600 "${ssh_dir}/authorized_keys"
+    chown -R "${username}:$(id -gn "$username")" "$ssh_dir"
+}
+
+# ── Helper: disable password auth for basher ──────────────────────────────────
+disable_password_auth() {
+    local username="$1"
+    passwd -l "$username" &>/dev/null
+    mkdir -p /etc/ssh/sshd_config.d
+    grep -qF "Match User ${username}" "$SSHD_CONF" 2>/dev/null || cat >> "$SSHD_CONF" <<EOF
+Match User ${username}
+    PasswordAuthentication no
+EOF
+    log "Password auth disabled for basher: $username"
+}
+
+# ── Helper: inject slang aliases into .bashrc ─────────────────────────────────
+inject_aliases() {
+    local bashrc="$1"
+    grep -qF "# === VAULT ALIASES ===" "$bashrc" 2>/dev/null && return
+    cat >> "$bashrc" <<'ALIASES'
+
+# === VAULT ALIASES ===
+alias cap='clear'
+alias sus='ls -la'
+alias mog='tail -n 20'
+alias rizz='whoami'
+alias vibe='uptime'
+alias bussin='df -h'
+ALIASES
+    log "Aliases injected → $bashrc"
+}
+
+# ── Helper: generate ASCII avatar ─────────────────────────────────────────────
+# FIX: normalise image URL to PNG so jp2a can handle it.
+# DiceBear SVG URLs are converted to PNG by swapping the path segment.
+normalise_image_url() {
+    local url="$1"
+    # Convert DiceBear SVG endpoint → PNG endpoint
+    echo "$url" | sed 's|/svg?|/png?|g'
+}
+
+generate_avatar() {
+    local username="$1" image_url="$2" home_dir="$3"
+    local tmp_img="/tmp/avatar_${username}_$$.png"
+    local avatar_file="${home_dir}/.avatar.txt"
+    local bashrc="${home_dir}/.bashrc"
+
+    local fetch_url
+    fetch_url=$(normalise_image_url "$image_url")
+
+    if curl -fsSL --max-time 15 -o "$tmp_img" "$fetch_url" 2>/dev/null; then
+        jp2a --width=60 "$tmp_img" > "$avatar_file" 2>/dev/null \
+            || echo "(avatar render failed)" > "$avatar_file"
+        rm -f "$tmp_img"
+    else
+        echo "(avatar unavailable)" > "$avatar_file"
+        log "WARNING: Could not download avatar for $username (URL: $fetch_url)"
+    fi
+    chown "${username}:" "$avatar_file"
+    chmod 644 "$avatar_file"
+
+    grep -qF "# === VAULT AVATAR ===" "$bashrc" 2>/dev/null && return
+    cat >> "$bashrc" <<'AVEOF'
+
+# === VAULT AVATAR ===
+cat "$HOME/.avatar.txt" 2>/dev/null
+AVEOF
+}
+
+# ── Helper: set ACLs on basher home ───────────────────────────────────────────
+set_basher_acls() {
+    local home_dir="$1"
+    chmod 700 "$home_dir"
+    setfacl -m "g:guards:r-x"   "$home_dir"
+    setfacl -m "g:wardens:r-x"  "$home_dir"
+    setfacl -m "o::---"         "$home_dir"
+    local dz="${home_dir}/Drop_Zone"
+    mkdir -p "$dz"
+    chmod 750 "$dz"
+    setfacl -m "g:guards:r-x"   "$dz"
+    setfacl -m "g:wardens:rwx"  "$dz"
+    setfacl -m "o::---"         "$dz"
+}
+
+# ── Helper: revoke users removed from YAML ────────────────────────────────────
+revoke_if_removed() {
+    local group="$1"; shift
+    local -a current=("$@")
+    while IFS= read -r sys_user; do
+        [[ -z "$sys_user" ]] && continue
+        local found=0
+        for u in "${current[@]}"; do [[ "$u" == "$sys_user" ]] && found=1 && break; done
+        if [[ $found -eq 0 ]]; then
+            passwd -l "$sys_user" 2>/dev/null || true
+            usermod -s /sbin/nologin "$sys_user" 2>/dev/null || true
+            log "REVOKED: $sys_user removed from $group (home preserved)"
+        fi
+    done < <(getent group "$group" | cut -d: -f4 | tr ',' '\n')
+}
+
+# =============================================================================
+# WARDENS
+# =============================================================================
+log "=== Processing Wardens ==="
+mkdir -p "$WARDEN_HOME"
+CURRENT_WARDENS=()
+warden_count=$(yq '.wardens | length' "$ROSTER")
+for ((i=0; i<warden_count; i++)); do
+    username=$(yq ".wardens[$i].username" "$ROSTER")
+    image_url=$(yq ".wardens[$i].image_url" "$ROSTER")
+    home_dir="${WARDEN_HOME}/${username}"
+    create_or_update_user "$username" "wardens" "$home_dir"
+    mkdir -p "$home_dir"
+    chown "${username}:wardens" "$home_dir"
+    chmod 750 "$home_dir"
+    generate_avatar "$username" "$image_url" "$home_dir"
+    CURRENT_WARDENS+=("$username")
+done
+
+# =============================================================================
+# GUARDS
+# =============================================================================
+log "=== Processing Guards ==="
+mkdir -p "$GUARD_HOME"
+CURRENT_GUARDS=()
+guard_count=$(yq '.guards | length' "$ROSTER")
+for ((i=0; i<guard_count; i++)); do
+    username=$(yq ".guards[$i].username" "$ROSTER")
+    image_url=$(yq ".guards[$i].image_url" "$ROSTER")
+    home_dir="${GUARD_HOME}/${username}"
+    create_or_update_user "$username" "guards" "$home_dir"
+    mkdir -p "$home_dir"
+    chown "${username}:guards" "$home_dir"
+    chmod 750 "$home_dir"
+    generate_avatar "$username" "$image_url" "$home_dir"
+    CURRENT_GUARDS+=("$username")
+done
+
+# =============================================================================
+# BASHERS
+# =============================================================================
+log "=== Processing Bashers ==="
+mkdir -p "$BASHER_HOME"
+CURRENT_BASHERS=()
+mkdir -p /etc/ssh/sshd_config.d
+: > "$SSHD_CONF"   # reset Match blocks on each run
+
+basher_count=$(yq '.bashers | length' "$ROSTER")
+for ((i=0; i<basher_count; i++)); do
+    username=$(yq ".bashers[$i].username" "$ROSTER")
+    image_url=$(yq ".bashers[$i].image_url" "$ROSTER")
+    ssh_key=$(yq ".bashers[$i].ssh_public_key // \"\"" "$ROSTER")
+    home_dir="${BASHER_HOME}/${username}"
+
+    create_or_update_user "$username" "bashers" "$home_dir"
+    mkdir -p "${home_dir}/Drop_Zone"
+    chown -R "${username}:bashers" "$home_dir"
+
+    disable_password_auth "$username"
+    [[ -n "$ssh_key" && "$ssh_key" != "null" ]] && inject_ssh_key "$username" "$ssh_key"
+    generate_avatar "$username" "$image_url" "$home_dir"
+    inject_aliases "${home_dir}/.bashrc"
+    set_basher_acls "$home_dir"
+    CURRENT_BASHERS+=("$username")
+done
+
+# =============================================================================
+# REVOKE removed users
+# =============================================================================
+log "=== Checking for removed users ==="
+revoke_if_removed "bashers"  "${CURRENT_BASHERS[@]:-}"
+revoke_if_removed "guards"   "${CURRENT_GUARDS[@]:-}"
+revoke_if_removed "wardens"  "${CURRENT_WARDENS[@]:-}"
+
+systemctl reload sshd 2>/dev/null || true
+log "=== initRoster complete ==="

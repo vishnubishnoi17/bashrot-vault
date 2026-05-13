@@ -1,0 +1,15 @@
+[Unit]
+Description=Vault Heist Monitor — watches bashers' Drop_Zone directories
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/scripts/verifyHeist
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=verifyHeist
+
+[Install]
+WantedBy=multi-user.target

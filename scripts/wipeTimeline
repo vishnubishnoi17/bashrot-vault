@@ -1,0 +1,103 @@
+#!/bin/bash
+# =============================================================================
+# wipeTimeline — Warden panic button: reset the simulation for the next round
+# Run as root / warden.
+# =============================================================================
+set -euo pipefail
+
+BASHER_HOME="/home/bashers"
+VAULT="/opt/Bashrot_vault"
+HIDDEN_SUBDIR="${VAULT}/.shadow_corridor"
+PID_FILE="/var/run/generateLore.pid"
+LOG="/var/log/vault/wipeTimeline.log"
+
+mkdir -p "$(dirname "$LOG")"
+log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG"; }
+
+# ── Permission check: wardens only ───────────────────────────────────────────
+if ! id -Gn | grep -qw "wardens"; then
+    echo "Access denied: wardens only." >&2
+    exit 1
+fi
+
+echo "⚠  wipeTimeline: This will reset the entire simulation."
+read -r -p "Type 'CONFIRM' to proceed: " confirm
+[[ "$confirm" == "CONFIRM" ]] || { echo "Aborted."; exit 0; }
+
+# ── 1. Terminate generateLore background process ─────────────────────────────
+log "Stopping generateLore..."
+if systemctl is-active --quiet generateLore 2>/dev/null; then
+    systemctl stop generateLore && log "Stopped generateLore service."
+elif [[ -f "$PID_FILE" ]]; then
+    pid=$(cat "$PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+        kill "$pid" && log "Killed generateLore (PID=$pid)"
+    else
+        log "generateLore PID=$pid not running (already dead)."
+    fi
+    rm -f "$PID_FILE"
+else
+    pkill -f "generateLore" 2>/dev/null && log "Killed generateLore (by name)" || log "generateLore not running."
+fi
+
+# ── 2. Terminate verifyHeist service ─────────────────────────────────────────
+log "Stopping verifyHeist..."
+if systemctl is-active --quiet verifyHeist 2>/dev/null; then
+    systemctl stop verifyHeist && log "Stopped verifyHeist service."
+else
+    pkill -f "verifyHeist" 2>/dev/null && log "Killed verifyHeist (by name)" || log "verifyHeist not running."
+fi
+
+# ── 3. Recursively wipe files in each basher's directory (keep dirs) ─────────
+log "Wiping basher home directories (preserving structure)..."
+for basher_dir in "$BASHER_HOME"/*/; do
+    [[ -d "$basher_dir" ]] || continue
+    basher=$(basename "$basher_dir")
+    find "$basher_dir" -type f \
+        ! -name ".bashrc" ! -name ".bash_profile" ! -name ".avatar.txt" \
+        -delete
+    find "${basher_dir}Drop_Zone" -type f -delete 2>/dev/null || true
+    log "Wiped files for basher: $basher"
+done
+
+# ── 4. Clean up noCapSecurity hidden file if tracked ─────────────────────────
+REAL_FILE_TRACKER="/var/run/vault/real_encoded_location"
+if [[ -f "$REAL_FILE_TRACKER" ]]; then
+    old_hidden_path=$(grep -v "^Real symlink:" "$REAL_FILE_TRACKER" 2>/dev/null | head -1 || true)
+    if [[ -n "$old_hidden_path" && -f "$old_hidden_path" ]]; then
+        rm -f "$old_hidden_path"
+        log "Removed noCapSecurity hidden file: $old_hidden_path"
+    fi
+    rm -f "$REAL_FILE_TRACKER"
+fi
+
+# ── 5. Wipe Bashrot_Vault contents and reset ACLs ────────────────────────────
+log "Wiping vault contents..."
+find "$VAULT" -mindepth 1 -type f -delete 2>/dev/null || true
+find "$VAULT" -mindepth 1 -type l -delete 2>/dev/null || true
+mkdir -p "$HIDDEN_SUBDIR"
+
+log "Resetting vault ACLs to secure defaults..."
+setfacl -b "$VAULT"
+setfacl -m "g:guards:rwx"  "$VAULT"
+setfacl -m "g:wardens:rwx" "$VAULT"
+setfacl -m "g:bashers:---" "$VAULT"
+setfacl -m "o::---"        "$VAULT"
+setfacl -d -m "g:guards:rwx"  "$VAULT"
+setfacl -d -m "g:wardens:rwx" "$VAULT"
+setfacl -d -m "g:bashers:---" "$VAULT"
+setfacl -d -m "o::---"        "$VAULT"
+
+setfacl -b "$HIDDEN_SUBDIR"
+setfacl -m "g:bashers:--x" "$HIDDEN_SUBDIR"
+setfacl -m "g:guards:rwx"  "$HIDDEN_SUBDIR"
+setfacl -m "g:wardens:rwx" "$HIDDEN_SUBDIR"
+setfacl -m "o::---"        "$HIDDEN_SUBDIR"
+
+# ── 6. Restart services for next round ───────────────────────────────────────
+log "Restarting generateLore and verifyHeist for next round..."
+systemctl start generateLore 2>/dev/null && log "generateLore restarted." || log "WARNING: generateLore failed to start."
+systemctl start verifyHeist  2>/dev/null && log "verifyHeist restarted."  || log "WARNING: verifyHeist failed to start."
+
+log "=== wipeTimeline complete. Simulation reset. ==="
+echo "✅ Simulation reset complete."
